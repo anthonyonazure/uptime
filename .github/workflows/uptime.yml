@@ -1,0 +1,86 @@
+name: uptime
+# Pings the two live sites and alerts Anthony's phone the moment either stops
+# answering. This lives in its own PUBLIC repository on purpose: GitHub charges
+# for scheduled runs in private repositories and not in public ones, and these
+# checks were costing about 5,000 billed minutes a month in private repos.
+#
+# Nothing here is sensitive. The addresses are public websites. The phone-alert
+# channel is kept in a repository secret, because anyone who knew it could push
+# notifications to that phone.
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # the checks
+    - cron: "7 0 1 * *"     # once a month, the keepalive below
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a clearly labelled test notification to prove the alert path works"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  ping:
+    name: uptime ping
+    if: github.event.schedule != '7 0 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    strategy:
+      fail-fast: false
+      matrix:
+        site:
+          - name: ReNew Wellness website
+            url: https://renewwellnessaz.com
+          - name: Patient Pulse Tracker
+            url: https://patientpulsetracker.com
+          # The homepage is static, so it stays up while sign-in is dead. The
+          # API rides on the site's own domain; if that route breaks, every data
+          # call fails and only this check notices.
+          - name: Patient Pulse Tracker sign-in and data
+            url: https://patientpulsetracker.com/api/health
+    steps:
+      - name: ping ${{ matrix.site.name }}
+        env:
+          URL: ${{ matrix.site.url }}
+        # Two tries a few seconds apart, so one dropped packet at 3am does not
+        # wake anybody. A site that fails both is genuinely not answering.
+        run: curl -fsS -m 20 -o /dev/null --retry 1 --retry-delay 5 "$URL"
+      - name: alert phone
+        if: failure()
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+          MESSAGE: "SITE DOWN - ${{ matrix.site.name }} - ${{ matrix.site.url }}"
+        run: curl -s -m 10 -d "$MESSAGE" "https://ntfy.sh/$TOPIC" || true
+
+  test-alert:
+    name: test the alert path
+    if: github.event_name == 'workflow_dispatch' && inputs.test_alert
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: send a labelled test notification
+        env:
+          TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: curl -fsS -m 10 -d "TEST ONLY - uptime monitor moved to a free home. Real alerts will look like this, starting with SITE DOWN." "https://ntfy.sh/$TOPIC"
+
+  # GitHub quietly switches off scheduled runs in a public repository that has
+  # had no commits for 60 days. Without this, the monitor would stop in two
+  # months and nothing would say so, which is the one failure a monitor must
+  # never have. One empty commit a month keeps it alive.
+  keepalive:
+    name: keep the schedule alive
+    if: github.event.schedule == '7 0 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+    steps:
+      - name: monthly empty commit
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${TOKEN}@github.com/${REPO}.git" r && cd r
+          git -c user.name=uptime-keepalive -c user.email=actions@users.noreply.github.com \
+            commit -q --allow-empty -m "Keep the uptime schedule alive"
+          git push -q origin HEAD
